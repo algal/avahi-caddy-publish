@@ -1,0 +1,15 @@
+[Unit]
+Description=Avahi publish Caddy .local names
+After=avahi-daemon.service
+Requires=avahi-daemon.service
+
+[Service]
+ExecStart=/usr/local/bin/avahi-caddy-publish --caddyfile /etc/caddy/Caddyfile --caddy-ip 192.168.1.100
+Restart=on-failure
+ProtectSystem=full
+ExecReload=/bin/kill -HUP $MAINPID
+User=avahi
+Group=avahi
+
+[Install]
+WantedBy=multi-user.target

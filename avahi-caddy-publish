@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+
+Publishes multiple subdomain-to-IP mappings by spawning
+avahi-publish processes with --address --no-reverse flags.
+
+"""
+
+import sys
+import os
+import signal
+import subprocess
+import time
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional
+import threading
+import argparse
+import ipaddress
+import re
+
+
+class AvahiPublisher:
+    def __init__(self, config_path: Optional[str] = None, address_args: Optional[List[List[str]]] = None, 
+                 caddyfile_path: Optional[str] = None, caddy_ip: Optional[str] = None):
+        self.config_path = Path(config_path) if config_path else None
+        self.address_args = address_args or []
+        self.caddyfile_path = Path(caddyfile_path) if caddyfile_path else None
+        self.caddy_ip = caddy_ip
+        self.config = {}
+        self.processes = []
+        self.shutdown_event = threading.Event()
+        self.process_lock = threading.Lock()
+        
+        # Track which mappings came from each source for reload purposes
+        self.file_mappings = []
+        self.cli_mappings = []
+        self.caddy_mappings = []
+        
+        # Set up logging - systemd-friendly format
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(levelname)s: %(message)s',
+            stream=sys.stdout
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def load_file_mappings(self) -> List[Dict[str, str]]:
+        """Load mappings from config file only."""
+        mappings = []
+        
+        if not self.config_path:
+            return mappings
+            
+        try:
+            with open(self.config_path, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    # Split into parts
+                    parts = line.split()
+                    if len(parts) < 2:
+                        self.logger.warning(f"Line {line_num}: Invalid format, need at least IP and hostname")
+                        continue
+                    
+                    ip_str = parts[0]
+                    hostnames = parts[1:]
+                    
+                    # Validate IP address
+                    try:
+                        ip_addr = ipaddress.IPv4Address(ip_str)
+                    except ipaddress.AddressValueError:
+                        self.logger.warning(f"Line {line_num}: Invalid IPv4 address '{ip_str}'")
+                        continue
+                    
+                    # Add mapping for each hostname
+                    for hostname in hostnames:
+                        mappings.append({
+                            'hostname': hostname,
+                            'address': str(ip_addr),
+                            'source': 'file'
+                        })
+                        
+        except FileNotFoundError:
+            self.logger.error(f"Configuration file not found: {self.config_path}")
+            sys.exit(1)
+        except Exception as e:
+            self.logger.error(f"Error reading config file: {e}")
+            sys.exit(1)
+            
+        return mappings
+    
+    def load_cli_mappings(self) -> List[Dict[str, str]]:
+        """Load mappings from command line arguments only."""
+        mappings = []
+        
+        for addr_group in self.address_args:
+            if len(addr_group) < 2:
+                self.logger.warning(f"Command line: --address needs at least IP and one hostname")
+                continue
+            
+            ip_str = addr_group[0]
+            hostnames = addr_group[1:]
+            
+            # Validate IP address
+            try:
+                ip_addr = ipaddress.IPv4Address(ip_str)
+            except ipaddress.AddressValueError:
+                self.logger.warning(f"Command line: Invalid IPv4 address '{ip_str}'")
+                continue
+            
+            # Add mapping for each hostname
+            for hostname in hostnames:
+                mappings.append({
+                    'hostname': hostname,
+                    'address': str(ip_addr),
+                    'source': 'cli'
+                })
+                
+        return mappings
+    
+    def load_caddy_mappings(self) -> List[Dict[str, str]]:
+        """Load mappings from Caddyfile by extracting .local hostnames."""
+        mappings = []
+        
+        if not self.caddyfile_path or not self.caddy_ip:
+            return mappings
+            
+        try:
+            # Validate the caddy IP address
+            caddy_addr = ipaddress.IPv4Address(self.caddy_ip)
+        except ipaddress.AddressValueError:
+            self.logger.error(f"Invalid --caddy-ip address: {self.caddy_ip}")
+            sys.exit(1)
+            
+        try:
+            local_hostnames = set()  # Use set to deduplicate
+            
+            # Regex to match Caddy address blocks ending with {
+            # Captures everything before { then finds all .local hostnames within that
+            block_pattern = r'^([^#]*?)\s*\{\s*(?:#.*)?$'
+            hostname_pattern = r'([a-zA-Z0-9][a-zA-Z0-9.-]*\.local)(?::\d+)?'
+            
+            with open(self.caddyfile_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    
+                    # Match lines that define address blocks (end with {)
+                    block_match = re.match(block_pattern, line)
+                    if block_match:
+                        address_part = block_match.group(1).strip()
+                        
+                        # Find all .local hostnames in the address part
+                        hostname_matches = re.findall(hostname_pattern, address_part)
+                        local_hostnames.update(hostname_matches)
+            
+            # Convert to mappings
+            for hostname in local_hostnames:
+                mappings.append({
+                    'hostname': hostname,
+                    'address': str(caddy_addr),
+                    'source': 'caddy'
+                })
+                        
+        except FileNotFoundError:
+            self.logger.error(f"Caddyfile not found: {self.caddyfile_path}")
+            sys.exit(1)
+        except Exception as e:
+            self.logger.error(f"Error reading Caddyfile: {e}")
+            sys.exit(1)
+            
+        return mappings
+
+    def load_config(self) -> None:
+        """Load configuration from all sources: hosts file, command line args, and Caddyfile."""
+        # Load from all sources
+        self.file_mappings = self.load_file_mappings()
+        self.cli_mappings = self.load_cli_mappings()
+        self.caddy_mappings = self.load_caddy_mappings()
+        
+        # Store in same format as before for compatibility
+        self.config = {'mappings': self.file_mappings + self.cli_mappings + self.caddy_mappings}
+        
+        if not self.config['mappings']:
+            self.logger.error("No valid mappings found in any configuration source")
+            sys.exit(1)
+        
+        # Count mappings from each source
+        file_count = len(self.file_mappings)
+        cli_count = len(self.cli_mappings)
+        caddy_count = len(self.caddy_mappings)
+        total_count = len(self.config['mappings'])
+        
+        # Generate appropriate log message based on what sources are present
+        sources = []
+        if file_count > 0:
+            sources.append(f"{file_count} from file")
+        if caddy_count > 0:
+            sources.append(f"{caddy_count} from Caddyfile")
+        if cli_count > 0:
+            sources.append(f"{cli_count} from command line")
+        
+        if len(sources) > 1:
+            source_str = f" ({', '.join(sources)})"
+        else:
+            source_str = f" from {sources[0].split(' from ')[1]}" if sources else ""
+        
+        self.logger.info(f"Loaded {total_count} address mappings{source_str}")
+
+    def reload_config(self) -> None:
+        """Reload config files (hosts file and Caddyfile) and update running processes."""
+        if not self.config_path and not self.caddyfile_path:
+            self.logger.info("No config files to reload (running with command line args only)")
+            return
+            
+        self.logger.info("Reloading configuration files...")
+        
+        # Load new file and Caddy mappings (CLI mappings stay the same)
+        old_file_mappings = self.file_mappings.copy()
+        old_caddy_mappings = self.caddy_mappings.copy()
+        
+        try:
+            new_file_mappings = self.load_file_mappings()
+            new_caddy_mappings = self.load_caddy_mappings()
+        except Exception as e:
+            self.logger.error(f"Failed to reload config files: {e}")
+            return
+        
+        # Combine old and new reloadable mappings (file + caddy)
+        old_reloadable = {(m['hostname'], m['address']) for m in old_file_mappings + old_caddy_mappings}
+        new_reloadable = {(m['hostname'], m['address']) for m in new_file_mappings + new_caddy_mappings}
+        
+        to_stop = old_reloadable - new_reloadable
+        to_start = new_reloadable - old_reloadable
+        
+        # Stop processes for removed mappings
+        stopped_count = 0
+        with self.process_lock:
+            for hostname, address in to_stop:
+                if self.stop_mapping(hostname, address, 'reloadable'):
+                    stopped_count += 1
+        
+        # Start processes for new mappings  
+        started_count = 0
+        with self.process_lock:
+            for hostname, address in to_start:
+                # Find the mapping in either file or caddy mappings
+                mapping = None
+                for m in new_file_mappings + new_caddy_mappings:
+                    if m['hostname'] == hostname and m['address'] == address:
+                        mapping = m
+                        break
+                if mapping and self.start_mapping(mapping):
+                    started_count += 1
+        
+        # Update stored mappings (CLI mappings remain unchanged)
+        self.file_mappings = new_file_mappings
+        self.caddy_mappings = new_caddy_mappings
+        self.config = {'mappings': self.file_mappings + self.cli_mappings + self.caddy_mappings}
+        
+        self.logger.info(f"Config reloaded: stopped {stopped_count}, started {started_count} mappings")
+
+    def stop_mapping(self, hostname: str, address: str, source: str) -> bool:
+        """Stop a specific mapping's process. Assumes process_lock is held."""
+        for i, (process, proc_hostname, proc_address, cmd) in enumerate(self.processes):
+            if proc_hostname == hostname and proc_address == address:
+                if process.poll() is None:
+                    self.logger.info(f"Stopping {hostname} -> {address} ({source})")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                
+                # Remove from processes list
+                self.processes.pop(i)
+                return True
+        return False
+    
+    def start_mapping(self, mapping: Dict[str, str]) -> bool:
+        """Start a process for a mapping. Assumes process_lock is held."""
+        hostname = mapping['hostname']
+        address = mapping['address']
+        source = mapping.get('source', 'unknown')
+        
+        try:
+            cmd = ['avahi-publish', '--address', '--no-reverse', hostname, address]
+            process = subprocess.Popen(cmd)  # Inherits stdout/stderr automatically
+            
+            self.processes.append((process, hostname, address, cmd))
+            self.logger.info(f"Started publishing {hostname} -> {address} ({source}) (PID: {process.pid})")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start publishing {hostname} -> {address}: {e}")
+            return False
+
+    def check_avahi_publish(self) -> bool:
+        """Check if avahi-publish is available."""
+        try:
+            result = subprocess.run(['which', 'avahi-publish'], 
+                                  capture_output=True, text=True)
+            return result.returncode == 0
+        except:
+            return False
+
+
+    def publish_addresses(self) -> None:
+        """Publish all address mappings from config."""
+        if not self.check_avahi_publish():
+            self.logger.error("avahi-publish command not found. Install avahi-utils package.")
+            sys.exit(1)
+
+        with self.process_lock:
+            for mapping in self.config['mappings']:
+                hostname = mapping.get('hostname')
+                address = mapping.get('address')
+                
+                if not hostname or not address:
+                    self.logger.warning(f"Skipping invalid mapping: {mapping}")
+                    continue
+                    
+                self.start_mapping(mapping)
+
+    def monitor_processes(self) -> None:
+        """Monitor running processes and restart if they die."""
+        while not self.shutdown_event.is_set():
+            with self.process_lock:
+                for i, (process, hostname, address, cmd) in enumerate(self.processes):
+                    if process.poll() is not None:
+                        # Process died, restart it
+                        self.logger.warning(f"Process for {hostname} died (exit code: {process.returncode}), restarting...")
+                        
+                        try:
+                            new_process = subprocess.Popen(cmd)  # Inherits stdout/stderr automatically
+                            
+                            self.processes[i] = (new_process, hostname, address, cmd)
+                            self.logger.info(f"Restarted publishing {hostname} -> {address} (PID: {new_process.pid})")
+                        except FileNotFoundError:
+                            self.logger.critical(f"avahi-publish command not found. Cannot restart {hostname}. Please reinstall avahi-utils and restart the service.")
+                            # Remove the process from the list to prevent repeated errors
+                            self.processes.pop(i)
+                        except Exception as e:
+                            self.logger.error(f"Failed to restart {hostname}: {e}")
+            
+            # Check every 5 seconds
+            if not self.shutdown_event.wait(5):
+                continue
+
+    def cleanup(self) -> None:
+        """Clean up processes."""
+        self.logger.info("Shutting down...")
+        self.shutdown_event.set()
+        
+        with self.process_lock:
+            # Terminate all processes gracefully
+            for process, hostname, address, cmd in self.processes:
+                if process.poll() is None:
+                    self.logger.info(f"Stopping {hostname} -> {address}")
+                    process.terminate()
+            
+            # Wait for graceful termination
+            for process, hostname, address, cmd in self.processes:
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=5)
+                        self.logger.info(f"Process for {hostname} terminated gracefully")
+                    except subprocess.TimeoutExpired:
+                        self.logger.warning(f"Force killing process for {hostname}")
+                        process.kill()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Failed to kill process for {hostname}")
+
+    def signal_handler(self, signum: int, frame) -> None:
+        """Handle shutdown and reload signals."""
+        signal_name = {
+            signal.SIGTERM: "SIGTERM",
+            signal.SIGINT: "SIGINT",
+            signal.SIGHUP: "SIGHUP"
+        }.get(signum, f"signal {signum}")
+        
+        if signum == signal.SIGHUP:
+            self.logger.info(f"Received {signal_name}, reloading config...")
+            self.reload_config()
+        else:
+            self.logger.info(f"Received {signal_name}, shutting down...")
+            self.cleanup()
+            
+            # Exit with appropriate code for systemd
+            if signum == signal.SIGTERM:
+                sys.exit(0)  # Clean shutdown
+            else:
+                sys.exit(128 + signum)  # Standard Unix convention
+
+    def run(self) -> None:
+        """Main execution loop."""
+        # Set up signal handlers for systemd compatibility
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGHUP, self.signal_handler)  # Reload config file
+        
+        # Load config
+        self.load_config()
+        
+        # Publish addresses
+        self.publish_addresses()
+        
+        # Start monitoring thread
+        monitor_thread = threading.Thread(target=self.monitor_processes, daemon=True)
+        monitor_thread.start()
+        
+        self.logger.info(f"Publishing {len(self.processes)} addresses (Ctrl+C to stop)")
+        
+        try:
+            # Keep main thread alive to handle signals
+            while not self.shutdown_event.is_set():
+                # Wait for shutdown event, checking periodically
+                if self.shutdown_event.wait(timeout=1):
+                    break
+                    
+        except KeyboardInterrupt:
+            self.logger.info("Interrupted by user")
+            self.cleanup()
+
+
+__version__ = "1.0.0"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Avahi address publisher, using Caddyfile, hosts file, or direct command line',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Using config file:
+  avahi-caddy-publish --file /etc/avahi/multihosts
+  
+  # Using command line args:
+  avahi-caddy-publish --address 192.168.1.10 foo.example.org foo bar
+  
+  # Using Caddyfile:
+  avahi-caddy-publish --caddyfile /etc/caddy/Caddyfile --caddy-ip 192.168.1.100
+  
+  # Combined usage:
+  avahi-caddy-publish -f /etc/avahi/multihosts --caddyfile /etc/caddy/Caddyfile --caddy-ip 192.168.1.100 -a 10.0.0.50 extra.host
+
+Hosts file format:
+  192.168.1.10    foo.example.org        foo bar
+  192.168.1.11    baz.local
+  # Comments are ignored
+
+Systemd Service Example (`/etc/systemd/system/avahi-caddy-publish.service`):
+  [Unit]
+  Description=Avahi Caddy .local Publisher
+  After=avahi-daemon.service
+  Requires=avahi-daemon.service
+
+  [Service]
+  ExecStart=/usr/local/bin/avahi-caddy-publish --caddyfile /etc/caddy/Caddyfile --caddy-ip 192.168.1.100
+  Restart=on-failure
+  ProtectSystem=full
+  User=avahi
+  Group=avahi
+
+  [Install]
+  WantedBy=multi-user.target
+        '''
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'%(prog)s {__version__}'
+    )
+    
+    parser.add_argument(
+        '-f', '--file',
+        metavar='CONFIG_FILE',
+        help='Path to hosts file containing hostname to IP mappings'
+    )
+    
+    parser.add_argument(
+        '--address', '-a',
+        nargs='+',
+        metavar=('IP_ADDRESS', 'HOSTNAME'),
+        action='append',
+        help='IPv4 address followed by one or more hostnames (can be used multiple times)'
+    )
+    
+    parser.add_argument(
+        '--caddyfile',
+        metavar='CADDYFILE_PATH',
+        help='Path to Caddyfile to extract .local hostnames from'
+    )
+    
+    parser.add_argument(
+        '--caddy-ip',
+        metavar='IP_ADDRESS',
+        help='IP address to map all Caddy .local hostnames to (required with --caddyfile)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate that at least one configuration method is provided
+    if not args.file and not args.address and not args.caddyfile:
+        parser.error("Must specify at least one of: --file, --address, or --caddyfile")
+    
+    # Validate Caddyfile requires caddy-ip
+    if args.caddyfile and not args.caddy_ip:
+        parser.error("--caddyfile requires --caddy-ip")
+    
+    if args.caddy_ip and not args.caddyfile:
+        parser.error("--caddy-ip requires --caddyfile")
+    
+    publisher = AvahiPublisher(args.file, args.address, args.caddyfile, args.caddy_ip)
+    publisher.run()
+
+
+if __name__ == "__main__":
+    main()
