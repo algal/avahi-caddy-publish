@@ -1,6 +1,6 @@
-# Avahi mDNS Publisher
+# Avahi Caddy mDNS Publisher
 
-This script solves a particular problem -- publishing multiple mDNS names, which map to the same IP host, optionally sourcing those names from a Caddyfile.
+This script solves a particular problem -- publishing multiple mDNS names, which map to the same IP address, optionally sourcing those names from a Caddyfile.
 
 Here is how to run it directly:
 
