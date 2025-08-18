@@ -56,7 +56,7 @@ solveit.box.local:80 {
 
 But caddy only configures your server to _respond_ to those names. Your server still needs to _publish_ those mDNS names. This is what avahi is for.
 
-Unfortunately, `avahi-publish --address --no-reverse` only publishes one name at at a time, so you need to create one avahi service definition per name. Also, each service definition is merely duplicating a name from your Caddyfile. Also, the `--no-reverse` flag is critical but rather obscure.
+Unfortunately, avahi does not support using a hosts file to map multiple names to a single IP address. For that, you need to use the `avahi-publish --address --no-reverse` command. But then,  `avahi-publish --address --no-reverse` only publishes one name at at a time, so you need to create one avahi service per name. This is a nuisance since each service definition is merely duplicating a name from your Caddyfile. Also, the `--no-reverse` flag is critical but rather obscure.
 
 This script solves those problems. It lets you create one systemd service definition that handles publishing mDNS names for all your services. It works by supervising multiple processes running `avahi-publish --address --no-reverse`, and by parsing your Caddyfile for the names. It is designed to run under systemd. It terminates, reloads, and logs output cleanly.
 
@@ -224,7 +224,9 @@ Established under name 'jupyter.box.local'
 
 Subprocess output (from `avahi-publish`) appears transparently for journalctl visibility.
 
-## Design Philosophy
+## Design Philosophy 
+
+This is intended for homelab setups where you want mDNS to automatically advertise services managed by Caddy reverse proxy.
 
 - **Simple and robust**: Minimal dependencies, clear error handling
 - **Transparent operation**: Subprocess output flows through unchanged  
@@ -232,4 +234,34 @@ Subprocess output (from `avahi-publish`) appears transparently for journalctl vi
 - **Caddyfile integration**: Automatically publishes services as you add them to Caddy
 - **Multiple sources**: Flexible configuration for different use cases
 
-This is intended for homelab setups where you want mDNS to automatically advertise services managed by Caddy reverse proxy.
+
+## Alternative Solutions
+
+Here are other possible ways to solve this problem:
+
+1. Use a [systemd service template](https://man7.org/linux/man-pages/man5/systemd.service.5.html) to instantiate a service definition per name. That is, use a template like the following:
+
+``` toml
+# file named: avahi-alias@.service
+[Unit]
+Description=Publish %I
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c "/usr/bin/avahi-publish --address --no-reverse %I 192.168.1.100"
+
+[Install]
+WantedBy=multi-user.target
+```
+
+And enable services with a command like ([SO answer)](https://serverfault.com/a/986437/180038):
+
+``` sh
+sudo systemctl enable --new avahi-alias@foo.local.service
+```
+
+This sure does seem more elegant than running a custom process supervisor under systemd, which is already a mature, standard process supervisor! So maybe the best solution is this plus custom scripts to sync the instantiated services with a Caddyfile? 
+
+2. [avahi-aliases](https://pypi.org/project/avahi-aliases/0.0.10/). (I haven't tried it but it looks relevant.)
+
+
