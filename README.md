@@ -241,7 +241,7 @@ Here are other possible ways to solve this problem:
 
 1. Use a [systemd service template](https://man7.org/linux/man-pages/man5/systemd.service.5.html) to instantiate a service definition per name. That is, use a template like the following:
 
-``` toml
+```
 # file named: avahi-alias@.service
 [Unit]
 Description=Publish %I
