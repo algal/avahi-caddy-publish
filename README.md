@@ -2,6 +2,8 @@
 
 This script solves a particular problem -- publishing multiple mDNS names, which map to the same IP address, optionally sourcing those names from a Caddyfile.
 
+(Or, in plain English: if you run a Linux server on your network (like Debian or Ubuntu), and you run various services which are hosted at different port numbers (8080, 8090, 4321, etc.), but you just want to be able to reach the services from devices on your network using simple names (like file.server.local, jupyter.server.local, openwebui.server.local, etc..), then this makes that easy. If you already use Caddy to proxy the services, then this makes it super easy.)
+
 Here is how to run it directly:
 
 ``` sh
@@ -40,7 +42,9 @@ Do you need this? What does the above mean? Here is the concrete problem and som
 
 Suppose that you have a home linux server `box` which runs services on various ports. You want devices on your home network to be able to browse to those services by using clean DNS names like `jupyter.box`. A natural solution for this is Caddy, which provides _virtual hosting_. That is, it configures your server to know those names, in order to map incoming HTTP requests from names to different internal port numbers.
 
-But suppose that, in addition, you don't want to reconfigure every single device on your network, or your router, or a public DNS server, to know about those names. In this case, a natural solution is to use multicast DNS (mDNS) names, like `jupyter.box.local` and `openwebui.box.local`. Multicast DNS lets the server advertise the names itself.
+But virtual hosting only solves one part of the problem.
+
+Suppose that, in addition, you don't want to reconfigure every single device on your network, or your router, or a public DNS server, to know about those names. In this case, a natural solution is to use multicast DNS (mDNS) names, like `jupyter.box.local` and `openwebui.box.local`. Multicast DNS lets the server advertise the names itself.
 
 So now your Caddyfile file looks like the following:
 
@@ -54,11 +58,11 @@ solveit.box.local:80 {
 }
 ```
 
-But caddy only configures your server to _respond_ to those names. Your server still needs to _publish_ those mDNS names. This is what avahi is for.
+That is, caddy only configures your server to _respond_ to those names. Your server still needs to _publish_ those mDNS names. This is what avahi is for. But it's harder than it should be.
 
 Unfortunately, avahi does not support using a hosts file to map multiple names to a single IP address. For that, you need to use the `avahi-publish --address --no-reverse` command. But then,  `avahi-publish --address --no-reverse` only publishes one name at at a time, so you need to create one avahi service per name. This is a nuisance since each service definition is merely duplicating a name from your Caddyfile. Also, the `--no-reverse` flag is critical but rather obscure.
 
-This script solves those problems. It lets you create one systemd service definition that handles publishing mDNS names for all your services. It works by supervising multiple processes running `avahi-publish --address --no-reverse`, and by parsing your Caddyfile for the names. It is designed to run under systemd. It terminates, reloads, and logs output cleanly.
+This script solves those problems. It lets you create one systemd service definition that handles publishing mDNS names for all your services. It works by supervising multiple processes running `avahi-publish --address --no-reverse`, and by parsing your Caddyfile to find the names to publish. It is designed to run smoothly under systemd. It terminates, reloads, and logs output cleanly.
 
 ## Installation
 
@@ -260,7 +264,7 @@ And enable services with a command like ([SO answer)](https://serverfault.com/a/
 sudo systemctl enable --new avahi-alias@foo.local.service
 ```
 
-This sure does seem more elegant than running a custom process supervisor under systemd, which is already a mature, standard process supervisor! So maybe the best solution is this plus custom scripts to sync the instantiated services with a Caddyfile? 
+This does seem more elegant than running a custom process supervisor under systemd, which is already a mature, standard process supervisor! So maybe the best solution is this plus custom scripts to sync the instantiated services with a Caddyfile? I haven't explored this but it could also work.
 
 2. [avahi-aliases](https://pypi.org/project/avahi-aliases/0.0.10/). (I haven't tried it but it looks relevant.)
 
