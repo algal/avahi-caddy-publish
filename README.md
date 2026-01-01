@@ -2,7 +2,7 @@
 
 This script solves a particular problem -- publishing multiple mDNS names, which map to the same IP address, optionally sourcing those names from a Caddyfile.
 
-(Or, in plain English: if you run a Linux server on your network (like Debian or Ubuntu), and you run various services which are hosted at different port numbers (8080, 8090, 4321, etc.), but you just want to be able to reach the services from devices on your network using simple names (like file.server.local, jupyter.server.local, openwebui.server.local, etc..), then this makes that easy. If you already use Caddy to proxy the services, then this makes it super easy.)
+Or, in plain English: if you run a Linux server on your network (like Debian or Ubuntu), and you run various services which are hosted at different port numbers (8080, 8090, 4321, etc.), but you just want to be able to reach the services from devices on your network using simple names (like file.server.local, jupyter.server.local, openwebui.server.local, etc..), then this makes that easy. If you already use Caddy to proxy the services, then this makes it super easy.
 
 Here is how to run it directly:
 
